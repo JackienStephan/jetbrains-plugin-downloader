@@ -221,7 +221,7 @@ class PluginFileManager:
         self._include_description = include_description
         self._include_change_notes = include_change_notes
 
-        self._regex = re.compile(r"^(?P<tool>[A-Z]+)-(?P<build>(?P<major>[0-9]+)(?:\.[0-9]+)*)$")
+        self._regex = re.compile(r"^((?P<tool>[A-Z]+)-)?(?P<build>(?P<major>[0-9]+)(?:\.[0-9]+)*)$")
 
         if not self._storage_url.endswith("/"):
             self._storage_url += "/"
@@ -277,13 +277,14 @@ class PluginFileManager:
             raise AssertionError(msg)
 
         tool = match.group("tool")
+        if tool is not None:
+            tool = "-" + tool
+        else:
+            tool = ""
         build = match.group("build")
         major = match.group("major")
 
-        if tool is None:
-            xml_path = self._base_path / f"plugins-{build}.xml"
-        else:
-            xml_path = self._base_path / f"plugins-{tool}-{build}.xml"
+        xml_path = self._base_path / f"plugins{tool}-{build}.xml"
 
         _log.info(
             "Create plugin file for build %s with %d entries in file %s",
@@ -302,7 +303,7 @@ class PluginFileManager:
             fh.write(data)
 
         if major_alias:
-            alias_path = self._base_path / f"plugins-{tool}-{major}.xml"
+            alias_path = self._base_path / f"plugins{tool}-{major}.xml"
             _log.info("Alias newest build %s of major %s as %s", build_id, major, alias_path)
             with alias_path.open("wb") as fh:
                 fh.write(data)
@@ -509,7 +510,7 @@ def main(config_file, log_level, include_plugin, cron_expr, log_path, pid_file):
             match = parsed[build_id]
             if match is None:
                 return ("", ())
-            return (match.group("tool"), version_select.build_sort_key(match.group("build")))
+            return (match.group("tool") or "", version_select.build_sort_key(match.group("build")))
 
         # Determine, per (tool, major), which fetched build is the newest one - that build's
         # plugins-<tool>-<build>.xml is also written as the stable plugins-<tool>-<major>.xml alias.
@@ -518,7 +519,7 @@ def main(config_file, log_level, include_plugin, cron_expr, log_path, pid_file):
             if match is None:
                 continue
 
-            key = (match.group("tool"), match.group("major"))
+            key = (match.group("tool") or "", match.group("major"))
             current = newest_per_major.get(key)
             if current is None or sort_key(build_id) > sort_key(current):
                 newest_per_major[key] = build_id
