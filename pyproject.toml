@@ -29,6 +29,7 @@ dependencies = [
     "pydantic",
     "orjson",
     "httpx",
+    "python-crontab",
 ]
 
 [project.scripts]

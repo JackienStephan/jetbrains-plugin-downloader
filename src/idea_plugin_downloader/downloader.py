@@ -9,6 +9,7 @@ import subprocess
 import typing
 import urllib.parse
 import urllib.request
+import os
 
 import click
 import pydantic
@@ -18,8 +19,12 @@ from lxml.builder import E
 
 from idea_plugin_downloader import version_select
 
+from crontab import CronTab
+
 _log = logging.getLogger(__name__)
 
+DEFAULT_PID_FILE="/var/run/downloader.pid"
+CRON_PID_FILE="/var/run/downloaderd.pid"
 
 class Config(pydantic.BaseModel):
     base_path: pathlib.Path
@@ -275,7 +280,10 @@ class PluginFileManager:
         build = match.group("build")
         major = match.group("major")
 
-        xml_path = self._base_path / f"plugins-{tool}-{build}.xml"
+        if tool is None:
+            xml_path = self._base_path / f"plugins-{build}.xml"
+        else:
+            xml_path = self._base_path / f"plugins-{tool}-{build}.xml"
 
         _log.info(
             "Create plugin file for build %s with %d entries in file %s",
@@ -364,7 +372,7 @@ class PluginManager:
                     if not self._downloader.download_plugin(plugin_entry=plugin_spec.entry, target_path=target_path):
                         continue
             else:
-                _log.info(
+                _log.debug(
                     "Plugin %s in version %s already downloaded.",
                     plugin_spec.entry.id,
                     plugin_spec.entry.version,
@@ -399,57 +407,131 @@ class PluginManager:
     multiple=True,
     help="Select plugin ids to include (can be repeated)",
 )
-def main(config_file, log_level, include_plugin):
-    logging.basicConfig(level=getattr(logging, log_level))
-    config = Config.parse_file(config_file)
+@click.option(
+    "--cron",
+    "cron_expr",
+    type=str,
+    help="crontab expression",
+    envvar="DL_CRON",
+)
+@click.option(
+    "--log-path",
+    type=str,
+    help="log file path",
+    default=None,
+    envvar="DL_LOG_PATH",
+)
+@click.option(
+    "--pid-file",
+    type=str,
+    help="create pid file",
+    is_flag=False,
+    flag_value=DEFAULT_PID_FILE,
+    default=None,
+)
+def main(config_file, log_level, include_plugin, cron_expr, log_path, pid_file):
 
-    sm = StorageManager(storage_path=config.storage_path)
-    dm = DownloadManager(base_url=config.upstream_url)
-    pfm = PluginFileManager(
-        base_path=config.base_path,
-        base_url=config.base_url,
-        storage_url=config.storage_url,
-        storage=sm,
-        include_vendor=config.include_vendor,
-        include_description=config.include_description,
-        include_change_notes=config.include_change_notes,
-    )
-    pm = PluginManager(base_url=config.upstream_url, storage=sm, downloader=dm, plugin_file_manager=pfm)
+    LEVEL = getattr(logging, log_level)
+    LOG_FMT = logging.Formatter(fmt="%(asctime)s - pid:%(process)d - %(levelname)s:%(name)s:%(message)s",
+                                datefmt="%Y-%m-%d %H:%M:%S")
 
-    versions = config.versions
+    if pathlib.Path("/.dockerenv").exists():
+        c_handler = logging.FileHandler("/proc/1/fd/2")
+    else:
+        c_handler = logging.StreamHandler()
+    c_handler.setLevel(LEVEL)
+    c_handler.setFormatter(LOG_FMT)
+    log_handlers = [c_handler]
 
-    if config.products:
-        selector = version_select.VersionSelector(config.products_url)
-        versions = set(config.versions) | set(selector.fetch_product_versions(config.products))
+    cron_cmd = f"/usr/local/bin/idea-plugin-downloader --config-file \"{config_file}\""
 
-    # Parse every build id once; unparsable ones fall through unchanged to download_for(), which
-    # relies on PluginFileManager.create_for() raising the existing AssertionError for them.
-    parsed = {build_id: pfm.parse_build_id(build_id) for build_id in versions}
+    if log_path:
+        f_handler = logging.FileHandler(log_path)
+        f_handler.setLevel(LEVEL)
+        f_handler.setFormatter(LOG_FMT)
+        log_handlers.append(f_handler)
+        cron_cmd += f" --log-path \"{log_path}\""
 
-    def sort_key(build_id: str) -> tuple:
-        match = parsed[build_id]
-        if match is None:
-            return ("", ())
-        return (match.group("tool"), version_select.build_sort_key(match.group("build")))
+    logging.basicConfig(level=LEVEL,handlers=log_handlers)
 
-    # Determine, per (tool, major), which fetched build is the newest one - that build's
-    # plugins-<tool>-<build>.xml is also written as the stable plugins-<tool>-<major>.xml alias.
-    newest_per_major: dict[tuple[str, str], str] = {}
-    for build_id, match in parsed.items():
-        if match is None:
-            continue
+    _pid_file = None
+    if cron_expr:
+        pid_file = CRON_PID_FILE
 
-        key = (match.group("tool"), match.group("major"))
-        current = newest_per_major.get(key)
-        if current is None or sort_key(build_id) > sort_key(current):
-            newest_per_major[key] = build_id
+    if pid_file:
+        _pid_file = pathlib.Path(pid_file)
+        if _pid_file.exists():
+            _log.warning("Another instance is already running (pid: %s), exit now.", _pid_file.read_text())
+            return 1
 
-    newest_build_ids = set(newest_per_major.values())
+        _pid_file.write_text(str(os.getpid()))
 
-    for build_id in sorted(versions, key=sort_key):
-        _log.info("Process plugins for build %s", build_id)
-        pm.download_for(build_id=build_id, included=include_plugin, major_alias=build_id in newest_build_ids)
+    try:
+        if cron_expr:
+            cron_cmd += f" --cron \"{cron_expr}\""
+            cron = CronTab(user='root')
+            exists = cron.find_command('idea-plugin-downloader')
 
-    pm.cleanup_old()
+            while (j := next(exists, None)) is not None:
+                cron.remove(j)
 
-    return 0
+            job = cron.new(command=cron_cmd)
+            job.setall(cron_expr)
+            cron.write()
+            _log.info("Cron task is set/updated at %s, with command: %s", cron_expr, cron_cmd)
+
+        config = Config.parse_file(config_file)
+
+        sm = StorageManager(storage_path=config.storage_path)
+        dm = DownloadManager(base_url=config.upstream_url)
+        pfm = PluginFileManager(
+            base_path=config.base_path,
+            base_url=config.base_url,
+            storage_url=config.storage_url,
+            storage=sm,
+            include_vendor=config.include_vendor,
+            include_description=config.include_description,
+            include_change_notes=config.include_change_notes,
+        )
+        pm = PluginManager(base_url=config.upstream_url, storage=sm, downloader=dm, plugin_file_manager=pfm)
+
+        versions = config.versions
+
+        if config.products:
+            selector = version_select.VersionSelector(config.products_url)
+            versions = set(config.versions) | set(selector.fetch_product_versions(config.products))
+
+        # Parse every build id once; unparsable ones fall through unchanged to download_for(), which
+        # relies on PluginFileManager.create_for() raising the existing AssertionError for them.
+        parsed = {build_id: pfm.parse_build_id(build_id) for build_id in versions}
+
+        def sort_key(build_id: str) -> tuple:
+            match = parsed[build_id]
+            if match is None:
+                return ("", ())
+            return (match.group("tool"), version_select.build_sort_key(match.group("build")))
+
+        # Determine, per (tool, major), which fetched build is the newest one - that build's
+        # plugins-<tool>-<build>.xml is also written as the stable plugins-<tool>-<major>.xml alias.
+        newest_per_major: dict[tuple[str, str], str] = {}
+        for build_id, match in parsed.items():
+            if match is None:
+                continue
+
+            key = (match.group("tool"), match.group("major"))
+            current = newest_per_major.get(key)
+            if current is None or sort_key(build_id) > sort_key(current):
+                newest_per_major[key] = build_id
+
+        newest_build_ids = set(newest_per_major.values())
+
+        for build_id in sorted(versions, key=sort_key):
+            _log.info("Process plugins for build %s", build_id)
+            pm.download_for(build_id=build_id, included=include_plugin, major_alias=build_id in newest_build_ids)
+
+        pm.cleanup_old()
+
+        return 0
+    finally:
+        if _pid_file:
+            _pid_file.unlink()
